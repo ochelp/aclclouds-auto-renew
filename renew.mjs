@@ -405,6 +405,71 @@ function classifyRenew(r) {
   return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
 }
 
+async function solveCapCaptcha(page) {
+  log('通过平台 Cap 验证码系统求解 token...');
+  return page.evaluate(async () => {
+    return new Promise((resolve, reject) => {
+      const endpoint = window.SiteConfiguration?.recaptcha?.apiEndpoint || 'https://cap.aclclouds.com/235a82a3e3/';
+      const timer = setTimeout(() => reject(new Error('Cap 验证码计算超时 (15s)')), 15000);
+
+      const container = document.createElement('div');
+      container.id = 'cap-solver-helper';
+      container.style.cssText = 'position:fixed;bottom:10px;right:10px;z-index:999999;';
+      const widget = document.createElement('cap-widget');
+      widget.setAttribute('data-cap-api-endpoint', endpoint);
+      widget.setAttribute('data-cap-disable-haptics', 'true');
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        try { container.remove(); } catch {}
+      };
+
+      widget.addEventListener('solve', (e) => {
+        const t = e.detail?.token || widget.token;
+        cleanup();
+        if (t) resolve(t);
+        else reject(new Error('未获取到 Cap token'));
+      });
+
+      widget.addEventListener('error', (e) => {
+        cleanup();
+        reject(new Error('Cap 求解错误: ' + JSON.stringify(e.detail || {})));
+      });
+
+      container.appendChild(widget);
+      document.body.appendChild(container);
+
+      let checks = 0;
+      const interval = setInterval(() => {
+        checks++;
+        if (widget.token) {
+          clearInterval(interval);
+          cleanup();
+          return resolve(widget.token);
+        }
+        try {
+          const btn = widget.querySelector('.captcha-trigger') ||
+                      widget.shadowRoot?.querySelector('.captcha-trigger') ||
+                      widget.querySelector('[role="button"]') ||
+                      widget.shadowRoot?.querySelector('[role="button"]');
+          if (btn) btn.click();
+        } catch {}
+        if (checks > 20) clearInterval(interval);
+      }, 300);
+    });
+  });
+}
+
+async function getRenewalCaptchaToken(page) {
+  try {
+    const token = await solveCapCaptcha(page);
+    if (token) return token;
+  } catch (capErr) {
+    log(`Cap 自动求解未通过: ${capErr.message}，尝试降级旧版验证码接口...`);
+  }
+  return solveCaptchaApi(page, 'renewal_gate');
+}
+
 async function tryRenew(page, server) {
   const id = server.id;
   const name = server.name || id;
@@ -412,24 +477,18 @@ async function tryRenew(page, server) {
 
   if (DRY_RUN) return { id, ok: true, skip: true, text: `[DRY_RUN] ${name} (${id}) 跳过实际提交` };
 
-  // 1. UI 自动化续期 (增强容错、精准定位、非阻塞)
+  // 1. UI 自动化续期 (优先访问服务器控制台 /server/:id)
   try {
-    await page.goto(`${BASE}/dashboard/projects`, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(1500);
+    await page.goto(`${BASE}/server/${id}`, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(2000);
 
-    // 优先匹配当前服务器卡片内部可见的续期/激活按钮，其次匹配页面全局可见的续期按钮
-    const cardScope = `div:has-text("${id}"), tr:has-text("${id}"), [data-server-id="${id}"]`;
     const btnPatterns = [
-      `${cardScope} >> button:has-text("Renouveler"):visible`,
-      `${cardScope} >> button:has-text("Renew"):visible`,
-      `${cardScope} >> a:has-text("Renouveler"):visible`,
-      `${cardScope} >> a:has-text("Renew"):visible`,
-      `${cardScope} >> button:has-text("Réactiver"):visible`,
-      `${cardScope} >> button:has-text("Reactivate"):visible`,
+      'button:has-text("Renouveler maintenant"):visible',
+      'button:has-text("Renew now"):visible',
       'button:has-text("Renouveler"):visible',
       'button:has-text("Renew"):visible',
+      'button:has-text("Réactiver"):visible',
       'a:has-text("Renouveler"):visible',
-      'a:has-text("Renew"):visible',
     ];
 
     let targetBtn = null;
@@ -444,7 +503,7 @@ async function tryRenew(page, server) {
     }
 
     if (targetBtn) {
-      log(`找到 UI 续期按钮 [${matchedPat}], 执行点击...`);
+      log(`找到 /server/${id} UI 续期按钮 [${matchedPat}], 执行点击...`);
       let clicked = false;
       try {
         await targetBtn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
@@ -461,13 +520,16 @@ async function tryRenew(page, server) {
       }
 
       if (clicked) {
-        await page.waitForTimeout(2000);
-        const modal = page.locator("[role='dialog']:visible, .modal:visible, div[class*='modal']:visible").first();
+        await page.waitForTimeout(1500);
+        const modal = page.locator("[role='dialog']:visible, div[aria-labelledby='renew-captcha-title']:visible").first();
         if ((await modal.count()) > 0 && (await modal.isVisible().catch(() => false))) {
-          log('检测到防机器人人机验证弹窗, 开始过盾...');
+          log('检测到 Cap 验证码弹窗, 触发过盾...');
           try {
-            await solveCaptcha(page, "[role='dialog']");
-            await page.waitForTimeout(4000);
+            const capTrigger = modal.locator('.captcha-trigger, [role="button"], cap-widget').first();
+            if ((await capTrigger.count()) > 0) {
+              await capTrigger.click().catch(() => {});
+            }
+            await page.waitForTimeout(5000);
           } catch (e) {
             log(`弹窗验证码处理异常: ${e.message}`);
           }
@@ -475,15 +537,13 @@ async function tryRenew(page, server) {
 
         // 验证 UI 结果
         const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
-        if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText) || /renouvelé/i.test(bodyText)) {
-          const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
-          const exp = match ? `剩余 ${match[1]}` : '成功延期';
-          log(`UI 续期验证成功: ${exp}`);
-          return { id, ok: true, skip: false, text: `${name} (${id}): 续期成功 (${exp})` };
+        if (/Serveur renouvelé/i.test(bodyText) || /Expire dans\s+[2-9]j/i.test(bodyText) || /renouvelé/i.test(bodyText)) {
+          log(`UI 续期验证成功: ${name}`);
+          return { id, ok: true, skip: false, text: `${name} (${id}): UI 续期成功` };
         }
       }
     } else {
-      log('未找到可见的 UI 续期按钮，直接进入 API 续期逻辑');
+      log(`未在 /server/${id} 找到可见续期按钮，直接进入 API 续期逻辑`);
     }
   } catch (uiErr) {
     log(`UI 续期交互异常: ${uiErr.message}，自动转入 API 续期`);
@@ -499,7 +559,7 @@ async function tryRenew(page, server) {
   if (c.captcha) {
     log(`检测到 captcha_required, 获取 renewal_gate 验证码凭据...`);
     try {
-      const token = await solveCaptchaApi(page, 'renewal_gate');
+      const token = await getRenewalCaptchaToken(page);
       log(`获取到 captcha_token, 提交续期请求...`);
       r = await api(page, renewPath, 'POST', { captcha_token: token });
       log(`带 Token API 续期响应: HTTP ${r.status} ${JSON.stringify(r.data || '')}`);
