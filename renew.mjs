@@ -390,9 +390,10 @@ async function discover(page) {
 }
 
 function classifyRenew(r) {
-  if (r.status === 200) {
+  if (r.status >= 200 && r.status < 300) {
     const exp = r.data?.expires_at ? ` (到期: ${r.data.expires_at})` : '';
-    return { ok: true, skip: false, captcha: false, text: `续期成功${exp} ${r.data?.message || JSON.stringify(r.data).slice(0, 120)}` };
+    const msg = r.data?.message || (typeof r.data === 'string' ? r.data : JSON.stringify(r.data || {}));
+    return { ok: true, skip: false, captcha: false, text: `续期成功${exp} ${msg.slice(0, 120)}` };
   }
   if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
     return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
@@ -432,16 +433,18 @@ async function tryRenew(page, server) {
     ];
 
     let targetBtn = null;
+    let matchedPat = '';
     for (const pat of btnPatterns) {
       const loc = page.locator(pat).first();
       if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
         targetBtn = loc;
+        matchedPat = pat;
         break;
       }
     }
 
     if (targetBtn) {
-      log(`找到 UI 续期按钮, 执行点击...`);
+      log(`找到 UI 续期按钮 [${matchedPat}], 执行点击...`);
       let clicked = false;
       try {
         await targetBtn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
@@ -488,39 +491,32 @@ async function tryRenew(page, server) {
 
   // 2. API 直接续期及验证码补发
   log(`尝试 API 续期接口...`);
-  const renewPaths = [
-    `/api/client/servers/${id}/upgrade/renew`,
-    `/api/client/servers/${id}/renew`,
-  ];
-  let r = null;
-  let lastClassify = null;
+  const renewPath = `/api/client/servers/${id}/upgrade/renew`;
+  let r = await api(page, renewPath, 'POST', {});
+  log(`API 初始响应: HTTP ${r.status} ${JSON.stringify(r.data || '')}`);
+  let c = classifyRenew(r);
 
-  for (const renewPath of renewPaths) {
-    r = await api(page, renewPath, 'POST', {});
-    lastClassify = classifyRenew(r);
-
-    if (lastClassify.captcha) {
-      log(`检测到 captcha_required, 获取 renewal_gate 验证码凭据...`);
-      try {
-        const token = await solveCaptchaApi(page, 'renewal_gate');
-        r = await api(page, renewPath, 'POST', { captcha_token: token });
-        lastClassify = classifyRenew(r);
-      } catch (e) {
-        lastClassify = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message}` };
-      }
+  if (c.captcha) {
+    log(`检测到 captcha_required, 获取 renewal_gate 验证码凭据...`);
+    try {
+      const token = await solveCaptchaApi(page, 'renewal_gate');
+      log(`获取到 captcha_token, 提交续期请求...`);
+      r = await api(page, renewPath, 'POST', { captcha_token: token });
+      log(`带 Token API 续期响应: HTTP ${r.status} ${JSON.stringify(r.data || '')}`);
+      c = classifyRenew(r);
+    } catch (e) {
+      c = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message}` };
     }
-
-    if (lastClassify.ok) break;
   }
 
-  let resultText = `${name} (${id}): ${lastClassify ? lastClassify.text : '无响应'}`;
+  let resultText = `${name} (${id}): ${c.text}`;
   const exactRemaining = formatRemaining(server.expiresAt);
-  if (lastClassify && lastClassify.skip && exactRemaining) {
+  if (c.skip && exactRemaining) {
     resultText = `${name} (${id}): 未到续期窗口，剩余 ${exactRemaining}`;
   }
 
-  log(`API 续期结果: ${resultText}`);
-  return { id, ok: lastClassify ? lastClassify.ok : false, skip: lastClassify ? lastClassify.skip : false, text: resultText };
+  log(`API 续期最终结果: ${resultText}`);
+  return { id, ok: c.ok, skip: c.skip, text: resultText };
 }
 
 function resolveExecutablePath() {
