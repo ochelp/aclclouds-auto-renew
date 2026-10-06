@@ -397,8 +397,8 @@ function classifyRenew(r) {
   if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
     return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
   }
-  const blob = JSON.stringify(r.data);
-  if (r.status === 403 && /captcha_required/i.test(blob)) {
+  const blob = typeof r.data === 'string' ? r.data : JSON.stringify(r.data || {});
+  if (r.status === 403 && (/captcha/i.test(blob) || /challenge/i.test(blob) || /token/i.test(blob) || blob === '{}' || blob === '""')) {
     return { ok: false, skip: false, captcha: true, text: 'HTTP 403 captcha_required' };
   }
   return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
@@ -411,64 +411,116 @@ async function tryRenew(page, server) {
 
   if (DRY_RUN) return { id, ok: true, skip: true, text: `[DRY_RUN] ${name} (${id}) 跳过实际提交` };
 
-  // 1. UI 自动化续期
-  await page.goto(`${BASE}/dashboard/projects`, { waitUntil: 'domcontentloaded' }).catch(() => {});
-  await page.waitForTimeout(1500);
+  // 1. UI 自动化续期 (增强容错、精准定位、非阻塞)
+  try {
+    await page.goto(`${BASE}/dashboard/projects`, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(1500);
 
-  const renewBtn = page.locator('button:has-text("Renouveler"), button:has-text("Renew")').first();
-  const hasBtn = (await renewBtn.count()) > 0;
+    // 优先匹配当前服务器卡片内部可见的续期/激活按钮，其次匹配页面全局可见的续期按钮
+    const cardScope = `div:has-text("${id}"), tr:has-text("${id}"), [data-server-id="${id}"]`;
+    const btnPatterns = [
+      `${cardScope} >> button:has-text("Renouveler"):visible`,
+      `${cardScope} >> button:has-text("Renew"):visible`,
+      `${cardScope} >> a:has-text("Renouveler"):visible`,
+      `${cardScope} >> a:has-text("Renew"):visible`,
+      `${cardScope} >> button:has-text("Réactiver"):visible`,
+      `${cardScope} >> button:has-text("Reactivate"):visible`,
+      'button:has-text("Renouveler"):visible',
+      'button:has-text("Renew"):visible',
+      'a:has-text("Renouveler"):visible',
+      'a:has-text("Renew"):visible',
+    ];
 
-  if (hasBtn) {
-    log(`找到 UI 续期按钮,执行点击...`);
-    await renewBtn.click();
-    await page.waitForTimeout(2000);
-
-    const modal = page.locator("[role='dialog']");
-    if ((await modal.count()) > 0) {
-      log('检测到防机器人人机验证弹窗,开始过盾...');
-      try {
-        await solveCaptcha(page, "[role='dialog']");
-        await page.waitForTimeout(4000);
-      } catch (e) {
-        log(`弹窗验证码处理异常: ${e.message}`);
+    let targetBtn = null;
+    for (const pat of btnPatterns) {
+      const loc = page.locator(pat).first();
+      if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+        targetBtn = loc;
+        break;
       }
     }
 
-    // 验证 UI 结果
-    const bodyText = await page.evaluate(() => document.body.innerText);
-    if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText)) {
-      const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
-      const exp = match ? `剩余 ${match[1]}` : '成功延期';
-      log(`UI 续期验证成功: ${exp}`);
-      return { id, ok: true, skip: false, text: `${name} (${id}): 续期成功 (${exp})` };
+    if (targetBtn) {
+      log(`找到 UI 续期按钮, 执行点击...`);
+      let clicked = false;
+      try {
+        await targetBtn.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+        await targetBtn.click({ timeout: 5000 });
+        clicked = true;
+      } catch (clickErr) {
+        log(`常规点击失败 (${clickErr.message}), 尝试 DOM 触发点击...`);
+        try {
+          await targetBtn.evaluate((el) => el.click());
+          clicked = true;
+        } catch (evalErr) {
+          log(`DOM 点击失败: ${evalErr.message}`);
+        }
+      }
+
+      if (clicked) {
+        await page.waitForTimeout(2000);
+        const modal = page.locator("[role='dialog']:visible, .modal:visible, div[class*='modal']:visible").first();
+        if ((await modal.count()) > 0 && (await modal.isVisible().catch(() => false))) {
+          log('检测到防机器人人机验证弹窗, 开始过盾...');
+          try {
+            await solveCaptcha(page, "[role='dialog']");
+            await page.waitForTimeout(4000);
+          } catch (e) {
+            log(`弹窗验证码处理异常: ${e.message}`);
+          }
+        }
+
+        // 验证 UI 结果
+        const bodyText = await page.evaluate(() => document.body.innerText).catch(() => '');
+        if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText) || /renouvelé/i.test(bodyText)) {
+          const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
+          const exp = match ? `剩余 ${match[1]}` : '成功延期';
+          log(`UI 续期验证成功: ${exp}`);
+          return { id, ok: true, skip: false, text: `${name} (${id}): 续期成功 (${exp})` };
+        }
+      }
+    } else {
+      log('未找到可见的 UI 续期按钮，直接进入 API 续期逻辑');
     }
+  } catch (uiErr) {
+    log(`UI 续期交互异常: ${uiErr.message}，自动转入 API 续期`);
   }
 
   // 2. API 直接续期及验证码补发
   log(`尝试 API 续期接口...`);
-  const renewPath = `/api/client/servers/${id}/upgrade/renew`;
-  let r = await api(page, renewPath, 'POST', {});
-  let c = classifyRenew(r);
+  const renewPaths = [
+    `/api/client/servers/${id}/upgrade/renew`,
+    `/api/client/servers/${id}/renew`,
+  ];
+  let r = null;
+  let lastClassify = null;
 
-  if (c.captcha) {
-    log(`检测到 captcha_required,获取 renewal_gate 验证码凭据...`);
-    try {
-      const token = await solveCaptchaApi(page, 'renewal_gate');
-      r = await api(page, renewPath, 'POST', { captcha_token: token });
-      c = classifyRenew(r);
-    } catch (e) {
-      c = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message}` };
+  for (const renewPath of renewPaths) {
+    r = await api(page, renewPath, 'POST', {});
+    lastClassify = classifyRenew(r);
+
+    if (lastClassify.captcha) {
+      log(`检测到 captcha_required, 获取 renewal_gate 验证码凭据...`);
+      try {
+        const token = await solveCaptchaApi(page, 'renewal_gate');
+        r = await api(page, renewPath, 'POST', { captcha_token: token });
+        lastClassify = classifyRenew(r);
+      } catch (e) {
+        lastClassify = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message}` };
+      }
     }
+
+    if (lastClassify.ok) break;
   }
 
-  let resultText = `${name} (${id}): ${c.text}`;
+  let resultText = `${name} (${id}): ${lastClassify ? lastClassify.text : '无响应'}`;
   const exactRemaining = formatRemaining(server.expiresAt);
-  if (c.skip && exactRemaining) {
+  if (lastClassify && lastClassify.skip && exactRemaining) {
     resultText = `${name} (${id}): 未到续期窗口，剩余 ${exactRemaining}`;
   }
 
   log(`API 续期结果: ${resultText}`);
-  return { id, ok: c.ok, skip: c.skip, text: resultText };
+  return { id, ok: lastClassify ? lastClassify.ok : false, skip: lastClassify ? lastClassify.skip : false, text: resultText };
 }
 
 function resolveExecutablePath() {
